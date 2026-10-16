@@ -200,14 +200,18 @@ def test_draft_vllm_config_only_propagates_draft_runner_type():
         runner_type="draft",
         architecture="draft-architecture",
         num_experts=0,
+        model="/path/to/target",
     )
     base_model_config = SimpleNamespace(
         runner_type="generate",
         architecture="target-architecture",
         num_experts=256,
+        model="/path/to/target",
     )
     base_vllm_config = SimpleNamespace(model_config=base_model_config)
     proposer = AscendSpecDecodeBaseProposer.__new__(AscendSpecDecodeBaseProposer)
+    proposer.method = "eagle"
+    proposer.vllm_config = base_vllm_config
     proposer.speculative_config = SimpleNamespace(
         draft_model_config=draft_model_config,
     )

@@ -4032,8 +4032,19 @@ class NPUModelRunner(GPUModelRunner):
                     break
             if self.drafter:
                 logger.info("Loading drafter model...")
+                # The drafter (e.g. DSpark with 64 experts) may call
+                # setup_moe_comm_method during model construction, which
+                # overwrites the global _MoECommMethods dict previously set
+                # by the target model (256 experts). Save and restore that
+                # dict so the target model's MoE communication configuration is
+                # not polluted by the drafter's different expert topology.
+                from vllm_ascend.ops.fused_moe.moe_comm_method import _MoECommMethods
+
+                saved_moe_comm_methods = dict(_MoECommMethods)
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
+                _MoECommMethods.clear()
+                _MoECommMethods.update(saved_moe_comm_methods)
 
             pp_group = get_pp_group()
             should_configure_aux_hidden_states = (

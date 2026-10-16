@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config, replace
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
@@ -21,6 +21,7 @@ from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
+from vllm.model_executor.models.utils import get_draft_quant_config
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
@@ -122,11 +123,38 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         Keep the target-derived model config otherwise unchanged. Replacing it
         with ``draft_model_config`` changes how generic proposers construct
         their layers and can invalidate target parallel settings.
+
+        DSpark standalone drafts (draft model path differs from the target)
+        are an exception: the draft has a different architecture (e.g. 64 vs
+        256 experts) and must use its own model_config and quant_config.
+        Reusing the target's W8A8 quant_config causes KeyError when the draft
+        layer constructors query quant prefixes (mtp.N.*) absent from the
+        target's quant description.
         """
         draft_vllm_config = super()._create_draft_vllm_config()
-        draft_vllm_config = copy.copy(draft_vllm_config)
-        draft_vllm_config.model_config = copy.copy(draft_vllm_config.model_config)
-        draft_vllm_config.model_config.runner_type = self.speculative_config.draft_model_config.runner_type
+
+        is_standalone_dspark = (
+            self.method == "dspark"
+            and self.speculative_config.draft_model_config is not None
+            and self.speculative_config.draft_model_config.model
+            != self.vllm_config.model_config.model
+        )
+
+        if is_standalone_dspark:
+            draft_model_config = self.speculative_config.draft_model_config
+            if not isinstance(getattr(draft_model_config, "hf_overrides", None), dict):
+                draft_model_config.hf_overrides = {}
+            draft_vllm_config = replace(
+                draft_vllm_config,
+                model_config=draft_model_config,
+                quant_config=get_draft_quant_config(draft_vllm_config),
+            )
+        else:
+            draft_vllm_config = copy.copy(draft_vllm_config)
+            draft_vllm_config.model_config = copy.copy(draft_vllm_config.model_config)
+        draft_vllm_config.model_config.runner_type = (
+            self.speculative_config.draft_model_config.runner_type
+        )
         return draft_vllm_config
 
     @staticmethod
