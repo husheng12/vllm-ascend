@@ -19,6 +19,8 @@
 
 import logging
 import math
+import os
+import re
 import sys
 import time
 from collections import defaultdict, deque
@@ -313,6 +315,14 @@ class NPUModelRunner(GPUModelRunner):
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+
+        # Optional DSpark prefill diagnostics.  This is deliberately controlled
+        # by an environment variable so existing serving commands keep exactly
+        # the same behavior when the feature is disabled.
+        self._dspark_prefill_dump_dir = os.environ.get("VLLM_DSPARK_PREFILL_DUMP_DIR")
+        self._dspark_prefill_dumped_req_ids: set[str] = set()
+        if self._dspark_prefill_dump_dir:
+            os.makedirs(self._dspark_prefill_dump_dir, exist_ok=True)
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
         self.device_metadata_providers: dict[int, DeviceMetadataTaskProvider] | None = None
@@ -2639,6 +2649,15 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # Keep the normal DSpark path completely free of dump work unless the
+        # opt-in environment variable is configured.
+        if self._dspark_prefill_dump_dir:
+            self._dump_dspark_prefill_outputs(
+                scheduler_output=scheduler_output,
+                aux_hidden_states=aux_hidden_states,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+            )
+
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
                 self.sampling_done_event = torch.npu.Event()
@@ -2831,6 +2850,61 @@ class NPUModelRunner(GPUModelRunner):
             async_output.async_copy_ready_event,
         )
         return async_output
+
+    @torch.inference_mode()
+    def _dump_dspark_prefill_outputs(
+        self,
+        *,
+        scheduler_output: "SchedulerOutput",
+        aux_hidden_states: list[torch.Tensor] | None,
+        sampled_token_ids: torch.Tensor,
+    ) -> None:
+        """Save target prefill features and the first sampled token per request.
+
+        The dump is intentionally performed after target sampling but before
+        bookkeeping/draft execution, so both values originate from the same
+        target-model forward.  Files contain CPU tensors and are independent
+        per request, which also works when a worker handles a batch.
+        """
+        dump_dir = self._dspark_prefill_dump_dir
+        if not dump_dir or aux_hidden_states is None:
+            return
+        # Auxiliary states are replicated on TP workers.  Only TP rank 0 owns
+        # the diagnostic file write; otherwise all ranks race on one path.
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        num_reqs = len(self.input_batch.req_ids)
+        if not num_reqs:
+            return
+        scheduled = np.asarray([
+            int(scheduler_output.num_scheduled_tokens[req_id])
+            for req_id in self.input_batch.req_ids[:num_reqs]
+        ])
+        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        offset = 0
+        dp_rank = int(self.vllm_config.parallel_config.data_parallel_rank)
+        for req_idx, num_tokens in enumerate(scheduled.tolist()):
+            num_tokens = int(num_tokens)
+            end = offset + num_tokens
+            # Initial prompt prefill has no previously computed tokens.  This
+            # also intentionally handles a one-token prompt.
+            is_initial_prefill = int(computed[req_idx]) == 0 and num_tokens > 0
+            req_id = str(self.input_batch.req_ids[req_idx])
+            if is_initial_prefill and req_id not in self._dspark_prefill_dumped_req_ids:
+                if end > aux_hidden_states[0].shape[0]:
+                    raise RuntimeError("Auxiliary hidden states are shorter than the scheduled prefill.")
+                states = [h[offset:end] for h in aux_hidden_states]
+                target_hidden_states = torch.cat(states, dim=-1).detach().to("cpu").contiguous()
+                seed_token_id = sampled_token_ids[req_idx, :1].detach().to("cpu", dtype=torch.int64).contiguous()
+                safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", req_id)[:180] or f"req-{req_idx}"
+                path = os.path.join(dump_dir, f"rank-{dp_rank:05d}-{safe_id}.pt")
+                torch.save({
+                    "target_hidden_states": target_hidden_states,
+                    "seed_token_id": seed_token_id,
+                }, path)
+                self._dspark_prefill_dumped_req_ids.add(req_id)
+            offset = end
+
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
