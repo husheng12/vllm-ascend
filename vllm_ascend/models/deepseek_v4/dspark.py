@@ -8,6 +8,7 @@ module. The target model provides selected layer hidden states; this model
 projects them into the draft attention context and emits a full draft block.
 """
 
+import os
 import typing
 from collections.abc import Iterable
 
@@ -45,6 +46,11 @@ from vllm_ascend.models.deepseek_v4.model import (
 )
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.utils import enable_dsa_cp
+from vllm_ascend.models.deepseek_v4.dspark_weight_verifier import (
+    fill_parameters_with_nan,
+    validate_loaded_params,
+    validate_no_nan_parameters,
+)
 
 
 def _apply_dsv4_rope(
@@ -448,6 +454,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        verify_weights = os.environ.get("VLLM_DSPARK_VERIFY_LOADED_WEIGHTS") == "1"
+        verify_expected = set(params_dict) if verify_weights else set()
+        if verify_weights:
+            fill_parameters_with_nan(params_dict.items(), verify_expected)
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -523,6 +533,18 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
                 loaded_params.add(name)
 
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
+        if verify_weights:
+            report = validate_loaded_params(verify_expected, loaded_params)
+            nan_report = validate_no_nan_parameters(
+                params_dict.items(), verify_expected
+            )
+            logger.info(
+                "DSpark draft weight verification passed: "
+                "expected=%d loaded=%d checked=%d nan=0",
+                len(report.expected),
+                len(report.loaded),
+                len(nan_report.checked),
+            )
         return loaded_params
 
     def _remap_dspark_name(self, name: str) -> str | None:
