@@ -166,12 +166,25 @@ __aicore__ inline void MoeGatingTopKHashWithoutGroup<T, U1, U2>::ComputeX()
         Muls(xNormTensor, xNormTensor, 1.0f / sumValue, expertCount_);
         PipeBarrier<PIPE_V>();
     } else {
+        // Stable softplus: naive ln(1 + e^x) overflows fp32 for x > ~88.7 and later top-k
+        // renormalization turns inf into NaN (inf/inf). Clamp the exp input at
+        // SOFTPLUS_LINEAR_THRESHOLD (exp(20) fits fp32) and add the clamped-off part back:
+        // ln(1 + e^min(x, T)) + (x - min(x, T)) == softplus(x) bit-exactly for x <= T and
+        // == x for x > T (PyTorch softplus threshold semantics).
         LocalTensor<float> calcNormTmpTensor = calcTmpBuf_.Get<float>();
-        Exp(calcNormTmpTensor, xInLocalTensor, expertCount_);
+        LocalTensor<float> xClampTensor = calcTmpBuf_.Get<float>()[expertCountAlign_ * CONSTANT_TWO];
+        LocalTensor<float> xClampOffsetTensor = calcTmpBuf_.Get<float>()[expertCountAlign_ * CONSTANT_THREE];
+        Mins(xClampTensor, xInLocalTensor, SOFTPLUS_LINEAR_THRESHOLD, expertCount_);
+        PipeBarrier<PIPE_V>();
+        Exp(calcNormTmpTensor, xClampTensor, expertCount_);
         PipeBarrier<PIPE_V>();
         Adds(calcNormTmpTensor, calcNormTmpTensor, float(1.0), expertCount_);
         PipeBarrier<PIPE_V>();
         Ln(calcNormTmpTensor, calcNormTmpTensor, expertCount_);
+        PipeBarrier<PIPE_V>();
+        Sub(xClampOffsetTensor, xInLocalTensor, xClampTensor, expertCount_);
+        PipeBarrier<PIPE_V>();
+        Add(calcNormTmpTensor, calcNormTmpTensor, xClampOffsetTensor, expertCount_);
         PipeBarrier<PIPE_V>();
         Sqrt(xNormTensor, calcNormTmpTensor, expertCount_);
         PipeBarrier<PIPE_V>();

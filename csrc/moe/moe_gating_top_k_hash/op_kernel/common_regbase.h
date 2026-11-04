@@ -30,6 +30,13 @@ constexpr int64_t MERGE_LIST_FOUR = 4;
 constexpr int64_t MERGE_LIST_IDX_TWO = 2;
 constexpr int64_t MERGE_LIST_IDX_THREE = 3;
 
+// Softplus(x) = ln(1 + e^x) overflows fp32 when x > ~88.7 (e^x > FLT_MAX). Following
+// PyTorch's softplus threshold semantics, x > threshold is evaluated in the linear regime.
+// exp(20) ~= 4.85e8 fits fp32, and fp32 rounds ln(1 + e^20) to exactly 20.0f, so
+// ln(1 + e^min(x, T)) + (x - min(x, T)) is bit-exact softplus(x) for x <= T and equals x
+// for x > T.
+constexpr float SOFTPLUS_LINEAR_THRESHOLD = 20.0f;
+
 __aicore__ inline int64_t Ceil(int64_t a, int64_t b)
 {
     if (b == 0) {

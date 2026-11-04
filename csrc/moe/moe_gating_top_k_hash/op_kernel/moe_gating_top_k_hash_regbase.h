@@ -441,6 +441,7 @@ namespace MoeGatingTopKHashRegbaseNS
                 RegTensor<float> vreg1;
                 RegTensor<float> vreg2;
                 RegTensor<float> vreg3;
+                RegTensor<float> vregXClamp;
                 MicroAPI::MaskReg preg0 = MicroAPI::CreateMask<float>();
                 uint16_t vfLoopNum = static_cast<uint16_t>(CeilDiv(size, VL_FLOAT_SIZE));
 
@@ -457,10 +458,17 @@ namespace MoeGatingTopKHashRegbaseNS
                     preg0 = MicroAPI::UpdateMask<float>(size);
                     LoadTwoTensorForDtypeT<T>(inputAddr, biasAddr, vregInFp32, vregBiasFp32, preg0, preg0,
                                               i * VL_FLOAT_SIZE, i * VL_FLOAT_SIZE);
-                    MicroAPI::Exp(vreg1, vregInFp32, preg0);
-                    MicroAPI::Adds(vreg2, vreg1, static_cast<float>(1), preg0);
+                    // Stable softplus: naive ln(1 + e^x) overflows fp32 for x > ~88.7.
+                    // Clamp the exp input at SOFTPLUS_LINEAR_THRESHOLD and add the
+                    // clamped-off part back: ln(1 + e^min(x, T)) + (x - min(x, T)) ==
+                    // softplus(x) bit-exactly for x <= T and == x for x > T.
+                    MicroAPI::Mins(vregXClamp, vregInFp32, SOFTPLUS_LINEAR_THRESHOLD, preg0);
+                    MicroAPI::Exp(vreg1, vregXClamp, preg0);
+                    MicroAPI::Adds(vreg2, vreg1, static_cast(1), preg0);
                     MicroAPI::Ln(vreg3, vreg2, preg0);
-                    MicroAPI::Sqrt(vregSoftplusResult, vreg3, preg0);
+                    MicroAPI::Sub(vreg1, vregInFp32, vregXClamp, preg0);
+                    MicroAPI::Add(vreg2, vreg3, vreg1, preg0);
+                    MicroAPI::Sqrt(vregSoftplusResult, vreg2, preg0);
                     // add bias
                     MicroAPI::Add(vregBiasResult, vregSoftplusResult, vregBiasFp32, preg0);
                     // 使用Arange生成排序索引, 起始值为i乘每个循环的veclen
@@ -495,6 +503,7 @@ namespace MoeGatingTopKHashRegbaseNS
                 RegTensor<float> vreg1;
                 RegTensor<float> vreg2;
                 RegTensor<float> vreg3;
+                RegTensor<float> vregXClamp;
                 MicroAPI::MaskReg preg0 = MicroAPI::CreateMask<float>();
                 uint16_t vfLoopNum = static_cast<uint16_t>(CeilDiv(size, VL_FLOAT_SIZE));
 
@@ -509,10 +518,17 @@ namespace MoeGatingTopKHashRegbaseNS
                 {
                     preg0 = MicroAPI::UpdateMask<float>(size);
                     LoadOneTensorForDtypeT<T>(inputAddr, vregInFp32, preg0, i * VL_FLOAT_SIZE);
-                    MicroAPI::Exp(vreg1, vregInFp32, preg0);
+                    // Stable softplus: naive ln(1 + e^x) overflows fp32 for x > ~88.7.
+                    // Clamp the exp input at SOFTPLUS_LINEAR_THRESHOLD and add the
+                    // clamped-off part back: ln(1 + e^min(x, T)) + (x - min(x, T)) ==
+                    // softplus(x) bit-exactly for x <= T and == x for x > T.
+                    MicroAPI::Mins(vregXClamp, vregInFp32, SOFTPLUS_LINEAR_THRESHOLD, preg0);
+                    MicroAPI::Exp(vreg1, vregXClamp, preg0);
                     MicroAPI::Adds(vreg2, vreg1, static_cast<float>(1), preg0);
                     MicroAPI::Ln(vreg3, vreg2, preg0);
-                    MicroAPI::Sqrt(vregSoftplusResult, vreg3, preg0);
+                    MicroAPI::Sub(vreg1, vregInFp32, vregXClamp, preg0);
+                    MicroAPI::Add(vreg2, vreg3, vreg1, preg0);
+                    MicroAPI::Sqrt(vregSoftplusResult, vreg2, preg0);
                     // 使用Arange生成排序索引, 起始值为i乘每个循环的veclen
                     MicroAPI::Arange(vregIndex, static_cast<int32_t>(i * VL_FLOAT_SIZE));
                     MicroAPI::DataCopy(softplusOutAddr + i * VL_FLOAT_SIZE, vregSoftplusResult, preg0);
